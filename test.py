@@ -10,6 +10,7 @@ import time
 from torch.optim.lr_scheduler import LambdaLR
 import pandas as pd
 import altair as alt
+import parser
 from torchtext.data.functional import to_map_style_dataset
 from torch.utils.data import DataLoader
 from torchtext.vocab import build_vocab_from_iterator
@@ -23,6 +24,8 @@ import torch.multiprocessing as mp
 from torch.nn.parallel import DistributedDataParallel as DDP
 from tools import *
 from module import *
+
+
 def make_model(src_vocab, tgt_vocab, N=6, d_model=512, d_ff=2048, h=8, dropout=0.1):
     "帮助: 从超参数中构建一个模型"
     c = copy.deepcopy
@@ -152,12 +155,19 @@ def run_epoch(
     return total_loss / total_tokens, train_state
 
 
-def example_simple_model():
-    device = torch.device("cuda:0" if torch.cuda.is_available() else "cpu")
-    V = 11
-    criterion = LabelSmoothing(size=V, padding_idx=0, smoothing=0.0)
-    model = make_model(V, V, N=2).to(device)
+def run_model(args):
+    device = torch.device(args.device if torch.cuda.is_available() else False)
+    criterion = LabelSmoothing(size=args.number_classes, padding_idx=0, smoothing=args.smoothing)
+    if os.path.exists("./weights") is False:
+            os.mkdir("./weights")
+    tb_writer = SummaryWriter()
 
+    number_classes = args.number_classes
+    batch_size = args.batch_size
+
+    model = make_model(args.number_classes, args.number_classes, N=2).to(device)
+
+    #optimizer - SGD Adam(AdaGrad/AdaDelta) 本质上是学习率的优化
     optimizer = torch.optim.Adam(
         model.parameters(), lr=0.5, betas=(0.9, 0.98), eps=1e-9
     )
@@ -169,11 +179,10 @@ def example_simple_model():
         ),
     )
 
-    batch_size = 80
-    for epoch in range(20):
+    for epoch in range(args.num_epochs):
         model.train()
         run_epoch(
-            data_gen(V, batch_size, 20),
+            data_gen(number_classes, batch_size, 20),
             model,
             SimpleLossCompute(model.generator, criterion),
             optimizer,
@@ -204,5 +213,17 @@ def example_simple_model():
 
 
 if __name__ == "__main__":
-    example_simple_model()
+    path = r"D:\PycharmProjects"
+    parser = argparse.ArgumentParser()
+    parser.add_argument("--number_classes", type=int, default=11)
+    parser.add_argument("--epochs",type=int, default=100)
+    parser.add_argument("--batch_size", type=int, default=16)
+    parser.add_argument("--learning_rate",type=float, default=0.001)
+    parser.add_argument("--data-path", type=str, default=path)
+    parser.add_argument("--device", type=str, default="cuda:0")
+    parser.add_argument("--smoothing", type=float,default=0.0)
+    opt = parser.parse_args()
+    run_model(opt)
+
+    run_model()
     #example_learning_schedule()

@@ -20,6 +20,7 @@ from torch.utils.data.distributed import DistributedSampler
 import torch.distributed as dist
 import torch.multiprocessing as mp
 from torch.nn.parallel import DistributedDataParallel as DDP
+from module import *
 
 RUN_EXAMPLES = True
 
@@ -116,7 +117,7 @@ class LabelSmoothing(nn.Module):
     def forward(self, x, target):
         assert x.size(1) == self.size
         # 克隆一份作为真实分布
-        true_dist = x.data.clone()
+        true_dist = x.data.to("cuda:0")
         # 用smoothing/(self.size - 2) 填充
         true_dist.fill_(self.smoothing / (self.size - 2))
         # 用confidence填充指定位置的数据，scatter_用法参考[8]
@@ -127,7 +128,7 @@ class LabelSmoothing(nn.Module):
             true_dist.index_fill_(0, mask.squeeze(), 0.0)
         self.true_dist = true_dist
         # detach，把变量从计算图分离，可参考 https://zhuanlan.zhihu.com/p/389738863
-        return self.criterion(x, true_dist.clone().detach())
+        return self.criterion(x, true_dist.to("cuda:0").detach())
 
 
 class SimpleLossCompute:

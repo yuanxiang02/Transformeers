@@ -4,13 +4,14 @@ from os.path import exists
 import torch
 import torch.nn as nn
 from torch.nn.functional import log_softmax, pad
+from torch.utils.tensorboard import SummaryWriter
 import math
 import copy
 import time
 from torch.optim.lr_scheduler import LambdaLR
 import pandas as pd
 import altair as alt
-import parser
+import argparse
 from torchtext.data.functional import to_map_style_dataset
 from torch.utils.data import DataLoader
 from torchtext.vocab import build_vocab_from_iterator
@@ -56,13 +57,13 @@ def mask(size):
     )
     return mask == 0
 
-def data_gen(V, batch_size, nbatches):
+def data_gen(V, batch_size, nbatches,device="cuda:0"):
     "为src-tgt复制任务生成一组随机的数据"
     for i in range(nbatches):
         data = torch.randint(1, V, size=(batch_size, 10))
         data[:, 0] = 1
-        src = data.requires_grad_(False).clone().detach()
-        tgt = data.requires_grad_(False).clone().detach()
+        src = data.requires_grad_(False).to(device).detach()
+        tgt = data.requires_grad_(False).to(device).detach()
         # 迭代器语法，yield
         yield Batch(src, tgt, 0)
 
@@ -84,6 +85,8 @@ def greedy_decode(model, src, src_mask, max_len, start_symbol):
 def run_epoch(
         data_iter,
         model,
+        epoch,
+        tb_writer,
         loss_compute,
         optimizer,
         scheduler,
@@ -92,7 +95,7 @@ def run_epoch(
         train_state=TrainState(),
 ):
     """一个训练epoch
-    data_iter: 可迭代对象，一次返回一个Batch对象或者加上索引
+    data_iter: 可迭代对象，一次返回一个Batch对象或 者加上索引
     model:训练的模型，这里就是Transformer
     loss_compute: SimpleLossCompute对象，用于计算损失
     optimizer: 优化器。这里是Adam优化器。验证时，optimizer是DummyOptimizer。DummyOptimizer不会真的更新模型参数，主要用于不同优化器效果的对比。
@@ -101,6 +104,7 @@ def run_epoch(
     accum_iter: 每迭代n个batch更新一次模型的参数。这里默认n=1，就是每次batch都更新参数。
     train_state: TrainState对象，用于保存前训练的情况
     """
+    print(("begin to run epoch - %d")%(epoch))
     start = time.time()
     total_tokens = 0
     total_loss = 0
@@ -113,7 +117,9 @@ def run_epoch(
         )
         # 这里才传入out和训练目标tgt_y计算了loss和loss_node。loss_node返回的是正则化的损失；
         # loss用来计算损失，loss_node用来梯度下降更新参数
+        
         loss, loss_node = loss_compute(out, batch.tgt_y, batch.ntokens)
+
         # loss_node = loss_node / accum_iter
         # 只有在train或者train+log的模式才开启参数更新
         if mode == "train" or mode == "train+log":
@@ -130,6 +136,9 @@ def run_epoch(
                 train_state.accum_step += 1
             # 我们在备注里提到过,scheduler的作用就是用来优化学习，控制学习率等超参数。这里调用step就是更新学习率相关的参数
             scheduler.step()
+        tags = ["train_loss", "train_loss_node"]
+        tb_writer.add_scalar(tags[0],loss,i)
+        tb_writer.add_scalar(tags[1],loss_node,i)
 
         total_loss += loss
         total_tokens += batch.ntokens
@@ -156,7 +165,9 @@ def run_epoch(
 
 
 def run_model(args):
-    device = torch.device(args.device if torch.cuda.is_available() else False)
+
+    device = torch.device(args.device if torch.cuda.is_available() else "cuda:1")
+    print(device)
     criterion = LabelSmoothing(size=args.number_classes, padding_idx=0, smoothing=args.smoothing)
     if os.path.exists("./weights") is False:
             os.mkdir("./weights")
@@ -166,8 +177,9 @@ def run_model(args):
     batch_size = args.batch_size
 
     model = make_model(args.number_classes, args.number_classes, N=2).to(device)
-
-    #optimizer - SGD Adam(AdaGrad/AdaDelta) 本质上是学习率的优化
+    print("model device ::" )
+    #print(model.device)
+    #optimizer - SGD Adam(AdaGrad/AdaDelta) 本质上是学习率的优化方式 各抒己见
     optimizer = torch.optim.Adam(
         model.parameters(), lr=0.5, betas=(0.9, 0.98), eps=1e-9
     )
@@ -179,11 +191,13 @@ def run_model(args):
         ),
     )
 
-    for epoch in range(args.num_epochs):
+    for epoch in range(args.epochs):
         model.train()
         run_epoch(
-            data_gen(number_classes, batch_size, 20),
-            model,
+            data_gen(number_classes, batch_size, args.number_batch),
+            model.to(device),
+            epoch,
+            tb_writer,
             SimpleLossCompute(model.generator, criterion),
             optimizer,
             lr_scheduler,
@@ -213,17 +227,18 @@ def run_model(args):
 
 
 if __name__ == "__main__":
-    path = r"D:\PycharmProjects"
+    print("parameter initialization ...............")
+    path = r".\cache"
     parser = argparse.ArgumentParser()
     parser.add_argument("--number_classes", type=int, default=11)
     parser.add_argument("--epochs",type=int, default=100)
-    parser.add_argument("--batch_size", type=int, default=16)
+    parser.add_argument("--batch_size", type=int, default=16) #生成每组数据的batch_size
     parser.add_argument("--learning_rate",type=float, default=0.001)
     parser.add_argument("--data-path", type=str, default=path)
     parser.add_argument("--device", type=str, default="cuda:0")
     parser.add_argument("--smoothing", type=float,default=0.0)
+    parser.add_argument("--number_batch",type=int,default=80)
     opt = parser.parse_args()
     run_model(opt)
 
-    run_model()
     #example_learning_schedule()

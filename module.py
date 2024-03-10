@@ -23,81 +23,56 @@ from torch.nn.parallel import DistributedDataParallel as DDP
 
 from tools import *
 
-def attention(query, key, value, mask=None, dropout=None):
-    "计算 '缩放点积注意力'"
-    # 返回Query最后一个轴的长度，即d_k
-    d_k = query.size(-1)
-    # key.transpose实际上做的就是转置
-    scores = torch.matmul(query, key.transpose(-2, -1)) / math.sqrt(d_k)
-    # 如果存在掩码，使用掩码计算得分
-    if mask is not None:
-        scores = scores.masked_fill(mask == 0, -1e9)
-    # 按照最后一个轴计算softmax,即按照每行内进行softmax
-    p_attn = scores.softmax(dim=-1)
-    # 如果dropout存在则进行dropout
-    if dropout is not None:
-        p_attn = dropout(p_attn)
-    # 最后和V相乘返回V的得分
-    return torch.matmul(p_attn, value), p_attn
-
-
-class MultiHeadedAttention(nn.Module):
-    def __init__(self, h, d_model, dropout=0.1):
+class MultiHeadedAttention(nn.Module): #input x(B,N,C)
+    def __init__(self,
+                 d_model,
+                 num_heads,
+                 atten_drop=0.1,
+                 proj_drop = 0.1):
         "接收多头的个数和维度进行初始化"
         super(MultiHeadedAttention, self).__init__()
-        assert d_model % h == 0
+        assert d_model % num_heads == 0
         # 假设d_v总是等于d_k
-        self.d_k = d_model // h
-        self.h = h
-        self.linears = clones(nn.Linear(d_model, d_model), 4)
-        self.attn = None
-        self.dropout = nn.Dropout(p=dropout)
+        head_dim = d_model // num_heads
+        self.scale = head_dim ** -0.5
+        self.num_heads = num_heads
+        self.qkv = nn.Linear(d_model,d_model*3)
+        self.attn_dropout = nn.Dropout(p=atten_drop)
+        self.proj = nn.Linear(d_model, d_model)
+        self.proj_dropout = nn.Dropout(p=proj_drop)
 
-    def forward(self, query, key, value, mask=None):
+
+    def forward(self, x, mask=None):
         "实现图2"
         if mask is not None:
             # 对每一个头都用相同的掩码
             mask = mask.unsqueeze(1)
         nbatches = query.size(0)
 
+        B,N,C = x.shape
         # 这一段原文的投影应该指的就是图里面第一个块后面那些阴影，其实就是多头
         # 1) 批量计算线性投影从 d_model => h x d_k
         # 这一段很鸡贼，给了四个前馈线性层网络，这段打包只用了前三个，最后一个前馈网络什么时候用呢？最后return用。
         # 分别把query,key,value传给这三个线性层，然后reshape(这里用的view)成多头。然后得到了query,key,value
-        query, key, value = [
-            lin(x).view(nbatches, -1, self.h, self.d_k).transpose(1, 2)
-            for lin, x in zip(self.linears, (query, key, value))
-        ]
+        qkv = self.qkv(x).reshape(B,N,3,self.num_heads,C // self.num_heads).permute(2,0,3,1,4)
+        q,k,v = qkv[0], qkv[1], qkv[2]
+        attn = (q @ k.transpose(-2,-1)) * self.scale
+        attn = attn.softmax(dim=-1)
+        attn = self.attn_dropout(attn)
 
-        # 2) 计算attention
-        x, self.attn = attention(
-            query, key, value, mask=mask, dropout=self.dropout
-        )
+        # 这里，用到了最后一个linear proj  drop_out
+        x = (attn @ v).transpose(1,2).reshape(B,N,C)
+        x = self.proj(x)
+        x = self.proj_dropout(x)
 
-        # 3) 在最后的线性层使用一个视图进行"Concat"，相当于把之前的多头变成单头
-        # 关于调用contiguous原因 https://blog.csdn.net/weixin_43332715/article/details/124749348：
-        # 1 transpose、permute等维度变换操作后，tensor在内存中不再是连续存储的，而view操作要求tensor的内存连续存储，所以需要contiguous来返回一个contiguous copy；
-        # 2 维度变换后的变量是之前变量的浅拷贝，指向同一区域，即view操作会连带原来的变量一同变形，这是不合法的，所以也会报错；---- 这个解释有部分道理，也即contiguous返回了tensor的深拷贝contiguous copy数据；
-
-        x = (
-            x.transpose(1, 2)
-            .contiguous()
-            .view(nbatches, -1, self.h * self.d_k)
-        )
-        del query
-        del key
-        del value
-
-        # 这里，用到了最后一个linear
-        return self.linears[-1](x)
+        return x
 
 
 class EncoderDecoder(nn.Module):
     """
     一个标准的解码器，编码器模型
     """
-
-    def __init__(self, encoder, decoder, src_embed, tgt_embed, generator):
+    def __init__(self, encoder, decoder, src_embed, tgt_embed, generator): #在test.py中的输入部分可以找到
         super(EncoderDecoder, self).__init__()
         self.encoder = encoder
         self.decoder = decoder
@@ -108,6 +83,7 @@ class EncoderDecoder(nn.Module):
     def forward(self, src, tgt, src_mask, tgt_mask):
         "接收处理屏蔽的src和目标序列"
         return self.decode(self.encode(src, src_mask), src_mask, tgt, tgt_mask)
+    
     "encoder - self src src_mask"
     def encode(self, src, src_mask):
         return self.encoder(self.src_embed(src), src_mask)
@@ -194,7 +170,7 @@ class EncoderLayer(nn.Module):
 
     def forward(self, x, mask):
         "同图1左边的链接所示"
-        x = self.sublayer[0](x, lambda x: self.self_attn(x, x, x, mask))
+        x = self.sublayer[0](x, lambda x: self.self_attn(x, mask)) #这里才是传入attn information的时候
         return self.sublayer[1](x, self.feed_forward)
 
 
@@ -225,9 +201,9 @@ class DecoderLayer(nn.Module):
     def forward(self, x, memory, src_mask, tgt_mask):
         "图1右边所示的解码器结构即下面的代码"
         m = memory
-        x = self.sublayer[0](x, lambda x: self.self_attn(x, x, x, tgt_mask))
+        x = self.sublayer[0](x, lambda x: self.self_attn(x, tgt_mask))
         # 解码器第二个attn的k,v是编码器提供的输出，用编码器的x去查解码器的attn输出。
-        x = self.sublayer[1](x, lambda x: self.src_attn(x, m, m, src_mask))
+        x = self.sublayer[1](x, lambda x: self.src_attn((x[0],m[1],m[2]), src_mask))
         return self.sublayer[2](x, self.feed_forward)
 
 
@@ -239,36 +215,6 @@ def subsequent_mask(size):
     )
     return subsequent_mask == 0
 
-
-def example_mask():
-    # 第一眼看这个嵌套循环给看懵了。其实就是用两个for循环生成了一个二维坐标，每一个都是一个df对象
-    # 看下面这个就好理解了
-    # 其实:=[(x,y) for y in range(20) for x in range(20)]
-
-    LS_data = pd.concat(
-        [
-            pd.DataFrame(
-                {
-                    "Subsequent Mask": subsequent_mask(20)[0][x, y].flatten(),
-                    "Window": y,
-                    "Masking": x,
-                }
-            )
-            for y in range(20)
-            for x in range(20)
-        ]
-    )
-    return (
-        alt.Chart(LS_data)
-        .mark_rect()
-        .properties(height=250, width=250)
-        .encode(
-            alt.X("Window:O"),
-            alt.Y("Masking:O"),
-            alt.Color("Subsequent Mask:Q", scale=alt.Scale(scheme="viridis")),
-        )
-        .interactive()
-    )
 
 class PositionwiseFeedForward(nn.Module):
     "实现一个FFN模型"
